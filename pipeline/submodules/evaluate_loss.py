@@ -1,11 +1,86 @@
 import torch
 import itertools
 import json
+import numpy as np
 
 from datasets import load_dataset
 
 from pipeline.utils.hook_utils import add_hooks
 from pipeline.model_utils.model_base import ModelBase
+
+
+# ADDED BY US
+def compute_loss_for_target_strings(
+    model_base: ModelBase,
+    instructions: list,
+    target_responses: list,
+    batch_size: int = 8,
+    fwd_pre_hooks=[],
+    fwd_hooks=[]
+):
+    """
+    Compute the loss of generating each target_response given each instruction.
+    Only the tokens corresponding to the response are included in the loss.
+    Returns a list of dicts with ce_loss, perplexity, n_tokens for each pair.
+    """
+    results = []
+    eoi_toks = torch.tensor(model_base.eoi_toks)
+
+    for i in range(0, len(instructions), batch_size):
+        batch_instructions = instructions[i:i+batch_size]
+        batch_responses = target_responses[i:i+batch_size]
+        inputs = model_base.tokenize_instructions_fn(
+            instructions=batch_instructions,
+            outputs=batch_responses
+        )
+        input_ids = inputs["input_ids"].to(model_base.model.device)
+        attention_mask = inputs["attention_mask"].to(model_base.model.device)
+
+        # Create loss mask: only compute loss for response tokens
+        loss_mask = attention_mask.clone()
+        for b in range(input_ids.shape[0]):
+            for j in range(input_ids.shape[1]):
+                # if j + eoi_toks.shape[0] > input_ids.shape[1]:
+                #     continue
+
+                if torch.all(input_ids[b, j:j+eoi_toks.shape[0]] == eoi_toks.to(input_ids.device)):
+                    loss_mask[b, :j + eoi_toks.shape[0] - 1] = 0
+                    break
+                # hack for Llama2 tokenization
+                if eoi_toks.shape[0] == 6 and (input_ids[b, j:j+eoi_toks.shape[0]] == eoi_toks.to(input_ids.device)).sum().item() >= eoi_toks.shape[0] - 2:
+                    loss_mask[b, :j + eoi_toks.shape[0] - 1] = 0
+                    break
+        loss_mask[:, -1] = 0
+
+        with add_hooks(module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=fwd_hooks):
+            outputs = model_base.model(input_ids=input_ids, attention_mask=attention_mask)
+
+        logits = outputs.logits
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        log_probs_for_labels = log_probs[:, :-1].gather(dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+        log_probs_for_labels = torch.cat(
+            [
+                log_probs_for_labels,
+                torch.zeros(log_probs_for_labels.shape[0]).unsqueeze(-1).to(log_probs_for_labels)
+            ],
+            dim=-1
+        )
+        log_probs_for_labels = log_probs_for_labels * loss_mask.to(log_probs_for_labels.device)
+
+        for b in range(input_ids.shape[0]):
+            total_loss = -log_probs_for_labels[b].sum()
+            n_tokens = loss_mask[b].sum()
+            ce_loss = total_loss / n_tokens
+            perplexity = torch.exp(ce_loss)
+            results.append(ce_loss.item())
+            # results.append({
+            #     "ce_loss": ce_loss.item(),
+            #     "perplexity": perplexity.item(),
+            #     "n_tokens": n_tokens.item()
+            # })
+    results = np.array(results)
+    return results
+
 
 def batch_iterator_chat_completions(dataset_instructions, dataset_outputs, tokenize_instructions_fn, batch_size, eoi_toks):
     it_instructions = iter(dataset_instructions)
